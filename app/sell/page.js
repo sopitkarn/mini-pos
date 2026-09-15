@@ -2,6 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import { supabase } from '../../lib/supabaseClient';
+import {
+  LOW_STOCK_THRESHOLD,
+  buildNewOrderMessage,
+  buildLowStockMessage,
+  buildBillSummaryMessage,
+  sendTelegramMessages,
+} from '../../lib/telegram';
 
 export default function SellPage() {
   // รายการสินค้าทั้งหมด (สำหรับ dropdown)
@@ -17,6 +24,7 @@ export default function SellPage() {
 
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  const [notifyMsg, setNotifyMsg] = useState(''); // สถานะการแจ้งเตือน Telegram
   const [submitting, setSubmitting] = useState(false);
 
   // โหลดรายการสินค้าจาก Supabase
@@ -53,6 +61,7 @@ export default function SellPage() {
     e.preventDefault();
     setErrorMsg('');
     setSuccessMsg('');
+    setNotifyMsg('');
 
     if (!pickedProductId) {
       setErrorMsg('กรุณาเลือกสินค้า');
@@ -102,7 +111,6 @@ export default function SellPage() {
       ];
     });
 
-    // เคลียร์ฟอร์มเลือกสินค้า
     setPickedProductId('');
     setPickedQuantity('');
   };
@@ -140,12 +148,12 @@ export default function SellPage() {
   const handleCheckout = async () => {
     setErrorMsg('');
     setSuccessMsg('');
+    setNotifyMsg('');
 
     if (cart.length === 0) {
       setErrorMsg('ยังไม่มีสินค้าในตะกร้า');
       return;
     }
-    // ตรวจสอบว่าทุกแถวมีจำนวนถูกต้อง และไม่เกิน stock ล่าสุด
     for (const item of cart) {
       const qty = Number(item.quantity);
       if (!qty || qty <= 0) {
@@ -161,7 +169,7 @@ export default function SellPage() {
     setSubmitting(true);
     const soldAt = new Date().toISOString();
 
-    // 1) บันทึกทุกรายการลงตาราง sales ในครั้งเดียว (1 แถวต่อ 1 สินค้า)
+    // 1) บันทึกทุกรายการลงตาราง sales ในครั้งเดียว
     const saleRows = cart.map((item) => ({
       product_id: item.productId,
       product_name: item.name,
@@ -178,7 +186,14 @@ export default function SellPage() {
       return;
     }
 
-    // 2) อัปเดต stock ของสินค้าแต่ละรายการ
+    // 2) อัปเดต stock ของสินค้าแต่ละรายการ + เก็บสต๊อกหลังตัดไว้ใช้แจ้งเตือน
+    const soldSummary = cart.map((item) => ({
+      productName: item.name,
+      quantity: Number(item.quantity),
+      totalPrice: item.price * Number(item.quantity),
+      stockAfter: item.stock - Number(item.quantity),
+    }));
+
     const updateResults = await Promise.all(
       cart.map((item) =>
         supabase
@@ -195,9 +210,45 @@ export default function SellPage() {
       return;
     }
 
+    // ==== ขายสำเร็จแล้ว: แสดงผลในเว็บก่อนเสมอ ====
     setSuccessMsg(
       `ขายสำเร็จ ${cart.length} รายการ (${totalItemsCount} ชิ้น) ยอดรวม ${grandTotal.toFixed(2)} บาท`
     );
+
+    // ==== 3) แจ้งเตือน Telegram (ไม่กระทบระบบขายหากล้มเหลว) ====
+    // ประกอบข้อความทั้งหมด: New Order ต่อรายการ + Low Stock ถ้าเหลือ <= 5
+    const messages = [];
+    for (const s of soldSummary) {
+      messages.push(buildNewOrderMessage({ ...s, soldAt }));
+      if (s.stockAfter <= LOW_STOCK_THRESHOLD) {
+        messages.push(buildLowStockMessage(s));
+      }
+    }
+    // ถ้าขายหลายรายการในบิลเดียว แนบสรุปยอดรวมท้ายสุด
+    if (cart.length > 1) {
+      messages.push(
+        buildBillSummaryMessage({
+          itemCount: cart.length,
+          totalQuantity: totalItemsCount,
+          grandTotal,
+          soldAt,
+        })
+      );
+    }
+
+    // ยิงแบบ async + จับ error ทั้งหมด ไม่ให้ throw ออกมาขัดจังหวะการขาย
+    try {
+      const result = await sendTelegramMessages(messages);
+      setNotifyMsg(
+        result.ok
+          ? '📨 ส่งแจ้งเตือนเข้า Telegram แล้ว'
+          : '⚠️ บันทึกการขายเรียบร้อย แต่ส่งแจ้งเตือน Telegram ไม่สำเร็จ'
+      );
+    } catch (err) {
+      console.error(err);
+      setNotifyMsg('⚠️ บันทึกการขายเรียบร้อย แต่ส่งแจ้งเตือน Telegram ไม่สำเร็จ');
+    }
+
     resetCart();
     await fetchProducts();
     setSubmitting(false);
@@ -207,7 +258,7 @@ export default function SellPage() {
     <div>
       <h1>ขายสินค้า</h1>
 
-      {/* สรุปยอดรวม - ตัวใหญ่ วางไว้บนสุด ให้ทั้งผู้ขายและลูกค้าเห็นชัด */}
+      {/* สรุปยอดรวม - ตัวใหญ่ วางไว้บนสุด */}
       <div
         style={{
           background: '#111827',
@@ -243,6 +294,7 @@ export default function SellPage() {
 
       {errorMsg && <p className="error-text">{errorMsg}</p>}
       {successMsg && <p className="success-text">{successMsg}</p>}
+      {notifyMsg && <p style={{ fontSize: '0.9rem', color: '#6b7280' }}>{notifyMsg}</p>}
 
       {loading ? (
         <p>กำลังโหลดข้อมูลสินค้า...</p>
@@ -297,36 +349,47 @@ export default function SellPage() {
                 </tr>
               </thead>
               <tbody>
-                {cart.map((item) => (
-                  <tr key={item.productId}>
-                    <td>{item.name}</td>
-                    <td>
-                      {Number(item.price).toFixed(2)} / {item.unit}
-                    </td>
-                    <td>
-                      <input
-                        type="number"
-                        min="1"
-                        max={item.stock}
-                        value={item.quantity}
-                        onChange={(e) =>
-                          handleCartQuantityChange(item.productId, e.target.value)
-                        }
-                        style={{ width: 70 }}
-                      />
-                    </td>
-                    <td>
-                      <strong>
-                        {(item.price * (Number(item.quantity) || 0)).toFixed(2)}
-                      </strong>
-                    </td>
-                    <td>
-                      <button onClick={() => handleRemoveFromCart(item.productId)}>
-                        ลบ
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {cart.map((item) => {
+                  const stockAfter = item.stock - (Number(item.quantity) || 0);
+                  return (
+                    <tr key={item.productId}>
+                      <td>
+                        {item.name}
+                        {/* เตือนล่วงหน้าในหน้าเว็บว่าขายแล้วสต๊อกจะเหลือน้อย */}
+                        {stockAfter <= LOW_STOCK_THRESHOLD && (
+                          <span style={{ color: '#dc2626', fontSize: '0.8rem' }}>
+                            {' '}⚠️ เหลือ {stockAfter}
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        {Number(item.price).toFixed(2)} / {item.unit}
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          min="1"
+                          max={item.stock}
+                          value={item.quantity}
+                          onChange={(e) =>
+                            handleCartQuantityChange(item.productId, e.target.value)
+                          }
+                          style={{ width: 70 }}
+                        />
+                      </td>
+                      <td>
+                        <strong>
+                          {(item.price * (Number(item.quantity) || 0)).toFixed(2)}
+                        </strong>
+                      </td>
+                      <td>
+                        <button onClick={() => handleRemoveFromCart(item.productId)}>
+                          ลบ
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
